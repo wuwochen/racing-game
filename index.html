@@ -81,20 +81,25 @@
 <body>
 <div id="passwordGate" style="position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;flex-direction:column;background:radial-gradient(circle at 50% 40%, rgba(30,40,60,.95), rgba(8,10,16,.99));">
   <h1 style="font-size:36px;letter-spacing:6px;background:linear-gradient(90deg,#58a6ff,#7ee787,#ffd33d);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:30px;">极速博弈 3D</h1>
-  <p style="color:#8b949e;font-size:13px;margin-bottom:20px;">请输入密码进入游戏</p>
+  <p style="color:#8b949e;font-size:13px;margin-bottom:20px;">请输入昵称和密码进入游戏</p>
+  <input id="nickInput" type="text" placeholder="昵称（最多12字）" maxlength="12" style="padding:12px 20px;font-size:16px;border:1px solid rgba(255,255,255,.2);border-radius:8px;background:rgba(255,255,255,.06);color:#e6edf3;outline:none;width:240px;text-align:center;margin-bottom:10px;" />
   <input id="pwInput" type="password" placeholder="密码" style="padding:12px 20px;font-size:16px;border:1px solid rgba(255,255,255,.2);border-radius:8px;background:rgba(255,255,255,.06);color:#e6edf3;outline:none;width:240px;text-align:center;letter-spacing:2px;" />
   <button id="pwBtn" style="margin-top:16px;padding:12px 36px;font-size:15px;font-weight:700;border:none;border-radius:30px;color:#0d1117;background:linear-gradient(90deg,#58a6ff,#7ee787);letter-spacing:2px;cursor:pointer;">进入</button>
   <p id="pwError" style="color:#ff7b72;font-size:12px;margin-top:12px;display:none;">密码错误，请重试</p>
 </div>
 <script>
-// 密码门控
+// 密码门控 + 昵称
 document.addEventListener('DOMContentLoaded', function(){
   const gate = document.getElementById('passwordGate');
+  const nickInput = document.getElementById('nickInput');
   const input = document.getElementById('pwInput');
   const btn = document.getElementById('pwBtn');
   const err = document.getElementById('pwError');
+  let gameNickname = '';
   function checkPw(){
     if(input.value === 'wuwochen'){
+      gameNickname = nickInput.value.trim() || 'Player' + Math.floor(Math.random()*1000);
+      window.gameNickname = gameNickname;
       gate.style.display = 'none';
     } else {
       err.style.display = 'block';
@@ -103,10 +108,13 @@ document.addEventListener('DOMContentLoaded', function(){
     }
   }
   btn.onclick = checkPw;
+  nickInput.addEventListener('keydown', function(e){
+    if(e.key === 'Enter') input.focus();
+  });
   input.addEventListener('keydown', function(e){
     if(e.key === 'Enter') checkPw();
   });
-  input.focus();
+  nickInput.focus();
 });
 </script>
 
@@ -185,8 +193,21 @@ function netHandleMessage(raw){
       break;
 
     case 'raceStart':
-      // 服务器通知开始比赛
+      // 服务器通知开始比赛，包含所有玩家信息（含 AI）
       net.racing = true;
+      // 初始化 AI 玩家位置数据
+      if(msg.players){
+        msg.players.forEach(p => {
+          if(p.id !== net.playerId && p.isAI){
+            // 为 AI 玩家创建远程车辆
+            let rp = net.remotePlayers.get(p.id);
+            if(!rp){
+              rp = { x:0, y:0, angle:0, speed:0, color:p.color, name:p.name, mesh:null, label:null, carType:p.carType, lastUpdate:performance.now() };
+              net.remotePlayers.set(p.id, rp);
+            }
+          }
+        });
+      }
       startNetRace(msg.map || 0);
       break;
 
@@ -219,11 +240,11 @@ function netHandleMessage(raw){
 async function netCreateRoom(roomName, playerName){
   try {
     if(!net.connected) await netConnect();
-    net.playerName = playerName;
+    net.playerName = playerName || window.gameNickname || 'Player' + Math.floor(Math.random()*1000);
     netSend({
       type: 'createRoom',
       roomName: roomName,
-      playerName: playerName,
+      playerName: net.playerName,
       color: '#ff8800',
       carType: selectedCarIdx,
       map: currentMapIdx
@@ -312,6 +333,7 @@ function updateRoomLobby(state){
     '<div style="display:flex;align-items:center;gap:8px;">' +
     '<span style="width:10px;height:10px;border-radius:50%;background:' + p.color + ';display:inline-block;"></span>' +
     '<span style="color:#e6edf3;">' + escapeHtml(p.name) + '</span>' +
+    (p.isAI ? '<span style="color:#8b949e;font-size:11px;">🤖 AI</span>' : '') +
     (p.isHost ? '<span style="color:#7ee787;font-size:11px;">👑 房主</span>' : '') +
     '</div>' +
     '<span style="color:' + (p.ready ? '#7ee787' : '#8b949e') + ';font-size:12px;">' + (p.ready ? '✓ 准备就绪' : '未准备') + '</span>' +
@@ -335,12 +357,32 @@ function startNetRace(mapIdx){
   currentMapIdx = mapIdx;
   isCityMode = false;
   // 清除远程玩家旧网格
-  net.remotePlayers.forEach(rp => { if(rp.mesh){ scene.remove(rp.mesh); rp.mesh = null; } });
+  net.remotePlayers.forEach(rp => { if(rp.mesh){ scene.remove(rp.mesh); rp.mesh = null; } if(rp.label){ scene.remove(rp.label); rp.label = null; } });
   net.remotePlayers.clear();
   // 启动比赛
   initAudio();
   resetGame();
   applyDayNight();
+  // 为网络远程玩家（含 AI）在起点生成车辆
+  // resetGame 已经生成了玩家 + 3 辆本地 AI，网络模式下我们清除本地 AI，只用服务器下发的
+  if(net.racing){
+    // 清除本地 AI 车辆，网络模式下由服务器管理
+    aiCars.forEach(c => { if(c.mesh) scene.remove(c.mesh); if(c.label) scene.remove(c.label); });
+    aiCars = [];
+    cars = [player];
+    document.getElementById('totalCars').textContent = cars.length + net.remotePlayers.size;
+    // 为远程 AI 玩家设置初始位置
+    const right = {x:-Math.sin(START_ANG), y:Math.cos(START_ANG)};
+    let aiIdx = 1;
+    net.remotePlayers.forEach((rp, id) => {
+      const back = aiIdx * 55, off = (aiIdx%2===0?1:-1)*30;
+      rp.x = START_PT.x - Math.cos(START_ANG)*back + right.x*off;
+      rp.y = START_PT.y - Math.sin(START_ANG)*back + right.y*off;
+      rp.angle = START_ANG;
+      rp.isAI = true;
+      aiIdx++;
+    });
+  }
   state = 'countdown'; countdown = 3000;
   const ov = document.getElementById('overlay');
   ov.classList.add('hidden');
@@ -363,21 +405,122 @@ function netUpdateRemoteMeshes(){
   const now = performance.now();
   net.remotePlayers.forEach((rp, id) => {
     if(!rp.mesh){
-      const ctIdx = 0;
+      const ctIdx = rp.carType || 0;
       const sc = carScale(ctIdx);
       rp.mesh = makeCarMesh(ctIdx, rp.color, sc);
       scene.add(rp.mesh);
+      rp.label = createNameLabel(rp.name, rp.color);
+      scene.add(rp.label);
+    }
+    // AI 车辆本地驾驶（沿赛道前进）
+    if(rp.isAI && !rp.lastUpdate){
+      rp.lastUpdate = now;
+    }
+    if(rp.isAI){
+      // 简易 AI：沿赛道行驶
+      if(!rp.trackIdx) rp.trackIdx = 0;
+      const target = track[rp.trackIdx % track.length];
+      const dx = target.x - rp.x, dy = target.y - rp.y;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      if(dist < 30){
+        rp.trackIdx = (rp.trackIdx + 1) % track.length;
+      }
+      const targetAngle = Math.atan2(dy, dx);
+      let diff = targetAngle - rp.angle;
+      while(diff > Math.PI) diff -= Math.PI*2;
+      while(diff < -Math.PI) diff += Math.PI*2;
+      rp.angle += diff * 0.08;
+      const speed = 2.5 + Math.random() * 0.5;
+      rp.x += Math.cos(rp.angle) * speed;
+      rp.y += Math.sin(rp.angle) * speed;
+      rp.speed = speed;
     }
     if(rp.mesh){
       rp.mesh.position.set(rp.x, 0, rp.y);
       rp.mesh.rotation.y = -rp.angle;
     }
-    // 10秒无更新则移除
-    if(now - rp.lastUpdate > 10000){
+    if(rp.label){
+      const ctIdx = rp.carType || 0;
+      const t = CAR_TYPES[ctIdx] || CAR_TYPES[0];
+      rp.label.position.set(rp.x, (t.rideH + t.bodyH + t.cabinH + 1.2) * carScale(ctIdx), rp.y);
+    }
+    // 10秒无更新则移除（仅非 AI）
+    if(!rp.isAI && now - rp.lastUpdate > 10000){
       if(rp.mesh) scene.remove(rp.mesh);
+      if(rp.label) scene.remove(rp.label);
       net.remotePlayers.delete(id);
     }
   });
+}
+
+/* ===== 车顶昵称标签 ===== */
+function createNameLabel(text, color){
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  const fontSize = 32;
+  ctx.font = 'bold ' + fontSize + 'px "Microsoft YaHei", sans-serif';
+  const textWidth = ctx.measureText(text).width;
+  const padX = 16, padY = 8;
+  canvas.width = textWidth + padX * 2;
+  canvas.height = fontSize + padY * 2;
+  // 重新设置字体（canvas resize 后会丢失）
+  ctx.font = 'bold ' + fontSize + 'px "Microsoft YaHei", sans-serif';
+  // 背景圆角
+  const r = 8;
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  ctx.beginPath();
+  ctx.moveTo(r, 0);
+  ctx.lineTo(canvas.width - r, 0);
+  ctx.quadraticCurveTo(canvas.width, 0, canvas.width, r);
+  ctx.lineTo(canvas.width, canvas.height - r);
+  ctx.quadraticCurveTo(canvas.width, canvas.height, canvas.width - r, canvas.height);
+  ctx.lineTo(r, canvas.height);
+  ctx.quadraticCurveTo(0, canvas.height, 0, canvas.height - r);
+  ctx.lineTo(0, r);
+  ctx.quadraticCurveTo(0, 0, r, 0);
+  ctx.closePath();
+  ctx.fill();
+  // 左侧颜色圆点
+  ctx.fillStyle = color || '#fff';
+  ctx.beginPath();
+  ctx.arc(padX + 6, canvas.height / 2, 5, 0, Math.PI * 2);
+  ctx.fill();
+  // 文字
+  ctx.fillStyle = '#e6edf3';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, padX + 16, canvas.height / 2 + 1);
+  // 生成 Sprite
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = THREE.LinearFilter;
+  const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+  const sprite = new THREE.Sprite(mat);
+  const scale = 0.012;
+  sprite.scale.set(canvas.width * scale, canvas.height * scale, 1);
+  sprite.renderOrder = 999;
+  return sprite;
+}
+
+/* ===== 为本地车辆添加标签 ===== */
+function addCarLabel(car, name, color){
+  if(car.label) scene.remove(car.label);
+  car.label = createNameLabel(name, color);
+  scene.add(car.label);
+}
+
+function updateCarLabels(){
+  cars.forEach(c => {
+    if(!c.label) return;
+    const t = CAR_TYPES[c.carTypeIdx||0] || CAR_TYPES[0];
+    const sc = carScale(c.carTypeIdx||0);
+    c.label.position.set(c.x, (t.rideH + t.bodyH + t.cabinH + 1.2) * sc, c.y);
+  });
+  // 玩家标签
+  if(player.label){
+    const t = CAR_TYPES[player.carTypeIdx||0] || CAR_TYPES[0];
+    const sc = carScale(player.carTypeIdx||0);
+    player.label.position.set(player.x, (t.rideH + t.bodyH + t.cabinH + 1.2) * sc, player.y);
+  }
 }
 </script>
 <div id="scene"></div>
@@ -1984,7 +2127,11 @@ let START_PT = track[0];
 let START_ANG = Math.atan2(track[5].y-track[0].y, track[5].x-track[0].x);
 
 function clearCarMeshes(){
-  cars.forEach(c=>{ if(c.mesh){ scene.remove(c.mesh); c.mesh=null; } });
+  cars.forEach(c=>{ 
+    if(c.mesh){ scene.remove(c.mesh); c.mesh=null; }
+    if(c.label){ scene.remove(c.label); c.label=null; }
+  });
+  if(player && player.label){ scene.remove(player.label); player.label=null; }
   // 清旧胎印
   skidMarks.forEach(m=>scene.remove(m)); skidMarks.length=0;
   // 清烟雾粒子
@@ -2009,6 +2156,7 @@ function resetGame(){
   player = new Car(START_PT.x - right.x*30, START_PT.y - right.y*30, START_ANG, '#ff8800','YOU',false);
   player.isPlayer=true; player.carTypeIdx=selectedCarIdx;
   player.mesh=makeCarMesh(selectedCarIdx, '#ff8800', carScale(selectedCarIdx)); scene.add(player.mesh);
+  addCarLabel(player, window.gameNickname || 'YOU', '#ff8800');
   if(isCityMode){
     // 城市自由模式：生成 3 辆 AI 交通车，随机位置出发
     const aiColors=['#4d9bff','#9d4dff','#4dd97a','#ffb84d','#4dd0e1','#ff6b6b','#f0a050'];
@@ -2027,6 +2175,7 @@ function resetGame(){
       c.carTypeIdx=ti;
       c.trackIdx = startIdx;  // AI 记忆赛道位置
       c.mesh=makeCarMesh(ti, aiColors[i], carScale(ti)); scene.add(c.mesh);
+      addCarLabel(c, 'AI·' + (i+1), aiColors[i]);
       aiCars.push(c);
     }
     cars=[player,...aiCars];
@@ -2044,6 +2193,7 @@ function resetGame(){
       c.aiSpeed = (1.02 + Math.random()*0.12) * 1.39;
       c.carTypeIdx=ti;
       c.mesh=makeCarMesh(ti, aiColors[i], carScale(ti)); scene.add(c.mesh);
+      addCarLabel(c, 'AI·' + (i+1), aiColors[i]);
       aiCars.push(c);
     }
     cars=[player,...aiCars];
@@ -2446,6 +2596,8 @@ function loop(ts){
     if(net.posTimer >= 3){ netSendPosition(); net.posTimer = 0; }  // 每3帧发一次位置（~20Hz）
     netUpdateRemoteMeshes();
   }
+  // 更新车顶昵称标签
+  updateCarLabels();
 
   if(state !== 'free' && player.finished && state!=='finished'){
     state='finished';
