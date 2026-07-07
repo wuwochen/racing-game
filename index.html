@@ -754,7 +754,7 @@ addEventListener('keydown', e=>{
     // 更新车头灯锥光
     cars.forEach(c=>{
       if(c.mesh && c.mesh.userData.headlightCones){
-        const coneI = headlightsOn ? (isNight ? 4.0 : 2.5) : (isNight ? 3.0 : 0);
+        const coneI = headlightsOn ? (isNight ? 4.0 : 2.5) : 0;
         c.mesh.userData.headlightCones.forEach(hc => {
           hc.intensity = coneI;
           hc.visible = coneI > 0;
@@ -939,12 +939,12 @@ function applyDayNight(){
     // 点亮路灯
     streetLampLights.forEach(l=>{ l.visible = true; l.intensity = 1.5; });
     // 点亮车头灯锥光 + 大灯材质高亮
-    if(SHARED_MATS.headlight) SHARED_MATS.headlight.emissiveIntensity = headlightsOn ? 1.5 : 0.9;
-    if(SHARED_MATS.led) SHARED_MATS.led.emissiveIntensity = headlightsOn ? 1.2 : 0.9;
+    if(SHARED_MATS.headlight) SHARED_MATS.headlight.emissiveIntensity = headlightsOn ? 1.5 : 0.2;
+    if(SHARED_MATS.led) SHARED_MATS.led.emissiveIntensity = headlightsOn ? 1.2 : 0.3;
     cars.forEach(c=>{
       if(c.mesh && c.mesh.userData.headlightCones){
-        const coneI = headlightsOn ? 4.0 : 3.0;
-        c.mesh.userData.headlightCones.forEach(hc => { hc.intensity = coneI; hc.visible = true; });
+        const coneI = headlightsOn ? 4.0 : 0;
+        c.mesh.userData.headlightCones.forEach(hc => { hc.intensity = coneI; hc.visible = coneI > 0; });
       }
     });
   } else {
@@ -2705,7 +2705,7 @@ function updateCarMeshes(){
     
     // === 车头灯锥光 ===
     if(c.mesh.userData.headlightCones){
-      const coneIntensity = isNight ? (headlightsOn ? 4.0 : 3.0) : (headlightsOn ? 2.5 : 0);
+      const coneIntensity = isNight ? (headlightsOn ? 4.0 : 0) : (headlightsOn ? 2.5 : 0);
       c.mesh.userData.headlightCones.forEach(hc => {
         hc.intensity = coneIntensity;
         hc.visible = coneIntensity > 0;
@@ -2716,14 +2716,16 @@ function updateCarMeshes(){
 function updateCamera(snap){
   const fx=Math.cos(player.angle), fy=Math.sin(player.angle);
   const k = carScale(player.carTypeIdx)/2;
+  const t = CAR_TYPES[player.carTypeIdx] || CAR_TYPES[0];
   if(firstPerson){
-    // 第一人称：车头位置，稍微抬高，看前方
+    // 第一人称：车头位置，基于车型实际高度抬高视角
+    const carH = (t.rideH + t.bodyH + t.cabinH) * k * 2;  // 车顶高度
     const eyeX = player.x + fx * 1.5 * k;
     const eyeZ = player.y + fy * 1.5 * k;
-    const eyeY = 2.2 * k;
+    const eyeY = carH * 0.85 + 0.5;  // 稍低于车顶，加固定偏移保证不低于地面
     camera.position.set(eyeX, eyeY, eyeZ);
     const lax = player.x + fx*15*k, laz = player.y + fy*15*k;
-    camera.lookAt(lax, 1.5*k, laz);
+    camera.lookAt(lax, eyeY - 0.3, laz);
     return;
   }
   // 第三人称追尾
