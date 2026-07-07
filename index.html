@@ -109,6 +109,277 @@ document.addEventListener('DOMContentLoaded', function(){
   input.focus();
 });
 </script>
+
+<script>
+/* =========================================================================
+   网络多人系统 — WebSocket 房间 + 位置同步
+   ========================================================================= */
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + 'racing-server-wuwochen.onrender.com/ws';
+let net = {
+  ws: null,
+  connected: false,
+  connecting: false,
+  room: null,
+  playerId: null,
+  playerName: 'Player',
+  inRoom: false,
+  racing: false,
+  isHost: false,
+  remotePlayers: new Map(),  // id -> {x, y, angle, speed, color, name, mesh, carType, lastUpdate}
+  posTimer: 0
+};
+
+function netConnect(){
+  return new Promise((resolve, reject) => {
+    if(net.ws && net.ws.readyState <= 1){ resolve(); return; }
+    net.connecting = true;
+    try {
+      net.ws = new WebSocket(WS_URL);
+    } catch(e){ reject(e); return; }
+    net.ws.onopen = () => {
+      net.connected = true;
+      net.connecting = false;
+      resolve();
+    };
+    net.ws.onerror = (e) => {
+      net.connecting = false;
+      reject(e);
+    };
+    net.ws.onclose = () => {
+      net.connected = false;
+      net.connecting = false;
+      // 如果在房间里，通知并返回菜单
+      if(net.inRoom){ net.inRoom = false; net.room = null; }
+    };
+    net.ws.onmessage = (ev) => { netHandleMessage(ev.data); };
+    setTimeout(() => { if(!net.connected) reject(new Error('timeout')); }, 10000);
+  });
+}
+
+function netSend(obj){
+  if(net.ws && net.ws.readyState === 1){
+    net.ws.send(JSON.stringify(obj));
+  }
+}
+
+function netHandleMessage(raw){
+  let msg;
+  try { msg = JSON.parse(raw); } catch { return; }
+
+  switch(msg.type){
+    case 'roomCreated':
+    case 'roomJoined':
+      net.room = msg.room;
+      net.playerId = msg.playerId;
+      net.inRoom = true;
+      net.isHost = (msg.type === 'roomCreated');
+      showRoomLobby(msg.room);
+      break;
+
+    case 'roomState':
+      if(net.inRoom) updateRoomLobby(msg);
+      break;
+
+    case 'searchResults':
+      displaySearchResults(msg.rooms);
+      break;
+
+    case 'raceStart':
+      // 服务器通知开始比赛
+      net.racing = true;
+      startNetRace(msg.map || 0);
+      break;
+
+    case 'position':
+      if(!net.racing) return;
+      let rp = net.remotePlayers.get(msg.id);
+      if(!rp){
+        // 新远程玩家，创建网格
+        rp = { x:msg.x, y:msg.y, angle:msg.angle, speed:msg.speed, color:msg.color, name:msg.name, mesh:null, lastUpdate:performance.now() };
+        const ctIdx = 0;
+        const sc = carScale(ctIdx);
+        rp.mesh = makeCarMesh(ctIdx, msg.color, sc);
+        scene.add(rp.mesh);
+        net.remotePlayers.set(msg.id, rp);
+      }
+      rp.x = msg.x; rp.y = msg.y; rp.angle = msg.angle; rp.speed = msg.speed;
+      rp.lastUpdate = performance.now();
+      break;
+
+    case 'playerFinished':
+      // 远程玩家完赛
+      break;
+
+    case 'error':
+      alert(msg.msg || '发生错误');
+      break;
+  }
+}
+
+async function netCreateRoom(roomName, playerName){
+  try {
+    if(!net.connected) await netConnect();
+    net.playerName = playerName;
+    netSend({
+      type: 'createRoom',
+      roomName: roomName,
+      playerName: playerName,
+      color: '#ff8800',
+      carType: selectedCarIdx,
+      map: currentMapIdx
+    });
+  } catch(e) {
+    alert('无法连接服务器，请稍后再试\n错误：' + e.message);
+  }
+}
+
+async function netSearchRooms(query, playerName, modal){
+  try {
+    if(!net.connected) await netConnect();
+    net.playerName = playerName;
+    net._searchModal = modal;
+    netSend({ type: 'searchRooms', query: query, playerName: playerName });
+  } catch(e) {
+    const resultsDiv = document.getElementById('searchResults');
+    if(resultsDiv) resultsDiv.innerHTML = '<p style="color:#ff7b72;font-size:13px;text-align:center;">无法连接服务器</p>';
+  }
+}
+
+function displaySearchResults(rooms){
+  const resultsDiv = document.getElementById('searchResults');
+  if(!resultsDiv) return;
+  if(!rooms || rooms.length === 0){
+    resultsDiv.innerHTML = '<p style="color:#8b949e;font-size:13px;text-align:center;">没有找到房间</p>';
+    return;
+  }
+  resultsDiv.innerHTML = rooms.map(r => 
+    '<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;margin-bottom:8px;border:1px solid rgba(255,255,255,.1);border-radius:8px;background:rgba(255,255,255,.04);">' +
+    '<div><span style="color:#e6edf3;font-weight:600;">' + escapeHtml(r.name) + '</span>' +
+    '<span style="color:#8b949e;font-size:12px;margin-left:8px;">' + r.count + '/' + r.max + '人</span>' +
+    (r.racing ? '<span style="color:#ff7b72;font-size:11px;margin-left:8px;">比赛中</span>' : '') +
+    '</div>' +
+    '<button class="joinBtn" data-room="' + escapeHtml(r.name) + '" style="padding:6px 16px;font-size:13px;font-weight:600;border:none;border-radius:6px;color:#0d1117;background:#58a6ff;cursor:pointer;"' + (r.racing||r.count>=r.max?'disabled style="opacity:.4;cursor:not-allowed;"':'') + '>加入</button>' +
+    '</div>'
+  ).join('');
+  resultsDiv.querySelectorAll('.joinBtn').forEach(btn => {
+    btn.onclick = function(){
+      const roomName = this.dataset.room;
+      if(net._searchModal){ document.body.removeChild(net._searchModal); net._searchModal = null; }
+      netSend({ type: 'joinRoom', roomName: roomName, playerName: net.playerName, color: '#3b82f6', carType: selectedCarIdx });
+    };
+  });
+}
+
+function escapeHtml(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function showRoomLobby(roomName){
+  // 关闭菜单覆盖层，显示房间大厅
+  const ov = document.getElementById('overlay');
+  ov.classList.remove('hidden');
+  ov.innerHTML = '';
+  const lobby = document.createElement('div');
+  lobby.id = 'roomLobby';
+  lobby.style.cssText = 'position:fixed;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;flex-direction:column;background:radial-gradient(circle at 50% 40%, rgba(30,40,60,.95), rgba(8,10,16,.99));';
+  lobby.innerHTML = `
+    <div style="background:#161b22;border:1px solid rgba(255,255,255,.15);border-radius:16px;padding:36px;min-width:420px;text-align:center;">
+      <h2 style="font-size:22px;color:#e6edf3;margin-bottom:8px;">🏠 房间：${escapeHtml(roomName)}</h2>
+      <p style="color:#8b949e;font-size:13px;margin-bottom:24px;">等待玩家加入... 房主可选择地图并开始比赛</p>
+      <div id="lobbyPlayers" style="margin-bottom:24px;"></div>
+      <div style="display:flex;gap:12px;justify-content:center;">
+        <button id="leaveRoomBtn" style="padding:10px 28px;font-size:14px;border:1px solid rgba(255,255,255,.2);border-radius:10px;background:rgba(255,255,255,.06);color:#c9d1d9;cursor:pointer;">离开房间</button>
+        <button id="startNetRaceBtn" style="padding:10px 28px;font-size:14px;font-weight:700;border:none;border-radius:10px;color:#0d1117;background:linear-gradient(90deg,#58a6ff,#7ee787);cursor:pointer;display:none;">开始比赛</button>
+      </div>
+    </div>`;
+  document.body.appendChild(lobby);
+  document.getElementById('leaveRoomBtn').onclick = function(){
+    netSend({ type: 'leaveRoom' });
+    net.inRoom = false; net.room = null;
+    document.body.removeChild(lobby);
+    renderMenu(false);
+  };
+  document.getElementById('startNetRaceBtn').onclick = function(){
+    netSend({ type: 'startRace' });
+  };
+}
+
+function updateRoomLobby(state){
+  const playersDiv = document.getElementById('lobbyPlayers');
+  if(!playersDiv) return;
+  playersDiv.innerHTML = state.players.map(p => 
+    '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 16px;margin-bottom:6px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(255,255,255,.03);">' +
+    '<div style="display:flex;align-items:center;gap:8px;">' +
+    '<span style="width:10px;height:10px;border-radius:50%;background:' + p.color + ';display:inline-block;"></span>' +
+    '<span style="color:#e6edf3;">' + escapeHtml(p.name) + '</span>' +
+    (p.isHost ? '<span style="color:#7ee787;font-size:11px;">👑 房主</span>' : '') +
+    '</div>' +
+    '<span style="color:' + (p.ready ? '#7ee787' : '#8b949e') + ';font-size:12px;">' + (p.ready ? '✓ 准备就绪' : '未准备') + '</span>' +
+    '</div>'
+  ).join('');
+  // 只有房主显示开始按钮
+  const startBtn = document.getElementById('startNetRaceBtn');
+  if(startBtn){
+    startBtn.style.display = net.isHost ? 'inline-block' : 'none';
+    // 至少2人才可开始
+    if(state.players.length < 2){ startBtn.style.opacity = '0.5'; startBtn.disabled = true; }
+    else { startBtn.style.opacity = '1'; startBtn.disabled = false; }
+  }
+}
+
+function startNetRace(mapIdx){
+  // 关闭房间大厅
+  const lobby = document.getElementById('roomLobby');
+  if(lobby) document.body.removeChild(lobby);
+  // 设置地图
+  currentMapIdx = mapIdx;
+  isCityMode = false;
+  // 清除远程玩家旧网格
+  net.remotePlayers.forEach(rp => { if(rp.mesh){ scene.remove(rp.mesh); rp.mesh = null; } });
+  net.remotePlayers.clear();
+  // 启动比赛
+  initAudio();
+  resetGame();
+  applyDayNight();
+  state = 'countdown'; countdown = 3000;
+  const ov = document.getElementById('overlay');
+  ov.classList.add('hidden');
+  ov.innerHTML = '<div id="countdown">3</div>';
+}
+
+function netSendPosition(){
+  if(!net.racing || !net.connected) return;
+  netSend({
+    type: 'position',
+    x: player.x,
+    y: player.y,
+    angle: player.angle,
+    speed: player.speed
+  });
+}
+
+function netUpdateRemoteMeshes(){
+  if(!net.racing) return;
+  const now = performance.now();
+  net.remotePlayers.forEach((rp, id) => {
+    if(!rp.mesh){
+      const ctIdx = 0;
+      const sc = carScale(ctIdx);
+      rp.mesh = makeCarMesh(ctIdx, rp.color, sc);
+      scene.add(rp.mesh);
+    }
+    if(rp.mesh){
+      rp.mesh.position.set(rp.x, 0, rp.y);
+      rp.mesh.rotation.y = -rp.angle;
+    }
+    // 10秒无更新则移除
+    if(now - rp.lastUpdate > 10000){
+      if(rp.mesh) scene.remove(rp.mesh);
+      net.remotePlayers.delete(id);
+    }
+  });
+}
+</script>
 <div id="scene"></div>
 
 <div id="hud">
@@ -2169,8 +2440,16 @@ function loop(ts){
   updateHUD();
   drawMinimap();
 
+  // 网络多人：同步位置 + 渲染远程车辆
+  if(net.racing){
+    net.posTimer++;
+    if(net.posTimer >= 3){ netSendPosition(); net.posTimer = 0; }  // 每3帧发一次位置（~20Hz）
+    netUpdateRemoteMeshes();
+  }
+
   if(state !== 'free' && player.finished && state!=='finished'){
     state='finished';
+    if(net.racing){ netSend({ type:'finishRace', id: net.playerId, time: player.lastLap || 0 }); }
     setTimeout(()=>{ showResults(); }, 2000);
   }
   renderer.render(scene,camera);
@@ -2350,6 +2629,13 @@ function drawMinimap(){
     mmx.fillStyle=c.isPlayer?'#ffd33d':c.color;
     mmx.beginPath(); mmx.arc(ox+c.x*s, oy+c.y*s, c.isPlayer?4:3, 0, 7); mmx.fill();
   });
+  // 网络远程玩家
+  if(net.racing){
+    net.remotePlayers.forEach(rp=>{
+      mmx.fillStyle=rp.color;
+      mmx.beginPath(); mmx.arc(ox+rp.x*s, oy+rp.y*s, 3, 0, 7); mmx.fill();
+    });
+  }
 }
 
 /* ---------- 结果 / 开始 ---------- */
@@ -2436,8 +2722,9 @@ function renderMenu(result){
     modal.style.cssText = 'position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.7);';
     modal.innerHTML = `
       <div style="background:#161b22;border:1px solid rgba(255,255,255,.15);border-radius:16px;padding:30px;min-width:360px;text-align:center;">
-        <h2 style="font-size:20px;color:#e6edf3;margin-bottom:20px;">创建房间</h2>
-        <input id="roomNameInput" type="text" placeholder="输入房间名" style="padding:12px 16px;font-size:15px;border:1px solid rgba(255,255,255,.2);border-radius:8px;background:rgba(255,255,255,.06);color:#e6edf3;outline:none;width:280px;text-align:center;margin-bottom:16px;" />
+        <h2 style="font-size:20px;color:#e6edf3;margin-bottom:20px;">🏠 创建房间</h2>
+        <input id="roomNameInput" type="text" placeholder="输入房间名（最多20字）" maxlength="20" style="padding:12px 16px;font-size:15px;border:1px solid rgba(255,255,255,.2);border-radius:8px;background:rgba(255,255,255,.06);color:#e6edf3;outline:none;width:280px;text-align:center;margin-bottom:16px;" />
+        <input id="playerNameInput" type="text" placeholder="你的昵称" maxlength="12" style="padding:12px 16px;font-size:15px;border:1px solid rgba(255,255,255,.2);border-radius:8px;background:rgba(255,255,255,.06);color:#e6edf3;outline:none;width:280px;text-align:center;margin-bottom:16px;" />
         <div style="display:flex;gap:12px;justify-content:center;">
           <button id="cancelRoomBtn" style="padding:10px 28px;font-size:14px;border:1px solid rgba(255,255,255,.2);border-radius:10px;background:rgba(255,255,255,.06);color:#c9d1d9;cursor:pointer;">取消</button>
           <button id="confirmRoomBtn" style="padding:10px 28px;font-size:14px;font-weight:700;border:none;border-radius:10px;color:#0d1117;background:linear-gradient(90deg,#58a6ff,#7ee787);cursor:pointer;">确定创建</button>
@@ -2448,12 +2735,15 @@ function renderMenu(result){
     document.getElementById('cancelRoomBtn').onclick = function(){ document.body.removeChild(modal); };
     document.getElementById('confirmRoomBtn').onclick = function(){
       const name = document.getElementById('roomNameInput').value.trim();
+      const pname = document.getElementById('playerNameInput').value.trim() || 'Player'+Math.floor(Math.random()*1000);
       if(!name){ document.getElementById('roomNameInput').focus(); return; }
-      // TODO: 实际网络创建房间逻辑
       document.body.removeChild(modal);
-      alert('房间「' + name + '」已创建！\n（网络功能开发中，当前为本地演示）');
+      netCreateRoom(name, pname);
     };
     document.getElementById('roomNameInput').addEventListener('keydown', function(e){
+      if(e.key === 'Enter') document.getElementById('playerNameInput').focus();
+    });
+    document.getElementById('playerNameInput').addEventListener('keydown', function(e){
       if(e.key === 'Enter') document.getElementById('confirmRoomBtn').click();
     });
   };
@@ -2464,8 +2754,9 @@ function renderMenu(result){
     modal.style.cssText = 'position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.7);';
     modal.innerHTML = `
       <div style="background:#161b22;border:1px solid rgba(255,255,255,.15);border-radius:16px;padding:30px;min-width:360px;text-align:center;">
-        <h2 style="font-size:20px;color:#e6edf3;margin-bottom:20px;">搜索房间</h2>
-        <input id="searchRoomInput" type="text" placeholder="输入房间名搜索" style="padding:12px 16px;font-size:15px;border:1px solid rgba(255,255,255,.2);border-radius:8px;background:rgba(255,255,255,.06);color:#e6edf3;outline:none;width:280px;text-align:center;margin-bottom:16px;" />
+        <h2 style="font-size:20px;color:#e6edf3;margin-bottom:20px;">🔍 搜索房间</h2>
+        <input id="searchRoomInput" type="text" placeholder="输入房间名搜索（留空列出全部）" style="padding:12px 16px;font-size:15px;border:1px solid rgba(255,255,255,.2);border-radius:8px;background:rgba(255,255,255,.06);color:#e6edf3;outline:none;width:280px;text-align:center;margin-bottom:16px;" />
+        <input id="joinPlayerName" type="text" placeholder="你的昵称" maxlength="12" style="padding:12px 16px;font-size:15px;border:1px solid rgba(255,255,255,.2);border-radius:8px;background:rgba(255,255,255,.06);color:#e6edf3;outline:none;width:280px;text-align:center;margin-bottom:16px;" />
         <div id="searchResults" style="max-height:200px;overflow-y:auto;margin-bottom:16px;text-align:left;"></div>
         <div style="display:flex;gap:12px;justify-content:center;">
           <button id="closeSearchBtn" style="padding:10px 28px;font-size:14px;border:1px solid rgba(255,255,255,.2);border-radius:10px;background:rgba(255,255,255,.06);color:#c9d1d9;cursor:pointer;">关闭</button>
@@ -2477,14 +2768,14 @@ function renderMenu(result){
     document.getElementById('closeSearchBtn').onclick = function(){ document.body.removeChild(modal); };
     document.getElementById('doSearchBtn').onclick = function(){
       const q = document.getElementById('searchRoomInput').value.trim();
-      const resultsDiv = document.getElementById('searchResults');
-      if(!q){ resultsDiv.innerHTML = '<p style="color:#8b949e;font-size:13px;text-align:center;">请输入房间名</p>'; return; }
-      // TODO: 实际网络搜索逻辑
-      resultsDiv.innerHTML = '<p style="color:#8b949e;font-size:13px;text-align:center;">未找到房间「' + q + '」\n（网络功能开发中）</p>';
+      const pname = document.getElementById('joinPlayerName').value.trim() || 'Player'+Math.floor(Math.random()*1000);
+      netSearchRooms(q, pname, modal);
     };
     document.getElementById('searchRoomInput').addEventListener('keydown', function(e){
       if(e.key === 'Enter') document.getElementById('doSearchBtn').click();
     });
+    // 自动搜索一次
+    document.getElementById('doSearchBtn').click();
   };
 }
 function showResults(){
